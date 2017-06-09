@@ -6,14 +6,17 @@ import rosbag
 import argparse
 import os
 import sys
+import signal
 import subprocess
 import colorsys
+import tf2_ros
+
 
 from collections import defaultdict
 from parse_tracklet import *
 from sensor_msgs.msg import Image
 from visualization_msgs.msg import Marker
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, TransformStamped
 
 # https://stackoverflow.com/questions/470690/how-to-automatically-generate-n-distinct-colors
 kelly_colors_dict = dict(
@@ -42,13 +45,13 @@ kelly_colors_list = kelly_colors_dict.values()
 CAMERA_TOPICS = ["/image_raw"]
 
 
-class Frame():
+class FrameObs():
     def __init__(self, trans, rotq, object_type, size):
         self.trans = trans
         self.rotq = rotq
         self.object_type = object_type
         self.size = size
-        
+
 
 class BoxSubPub():
     def __init__(self, frame_map, timestamp_map, sphere=False):
@@ -56,6 +59,7 @@ class BoxSubPub():
         self.timestamp_map = timestamp_map
         rospy.Subscriber("/image_raw", Image, self._img_callback)
         self.publisher = rospy.Publisher("bbox", Marker)
+        self.broadcaster = tf2_ros.TransformBroadcaster()
         self.sphere = sphere
 
     def _publish_marker(
@@ -88,6 +92,20 @@ class BoxSubPub():
         mark.color.b = color[2]
         self.publisher.publish(mark)
 
+    def _send_transform(self, trans, rotq, i):
+        t = TransformStamped()
+        t.header.stamp = rospy.Time().now()
+        t.header.frame_id = "velodyne"
+        t.child_frame_id = 'obs%d' % i
+        t.transform.translation.x = trans[0]
+        t.transform.translation.y = trans[1]
+        t.transform.translation.z = trans[2]
+        t.transform.rotation.x = rotq[0]
+        t.transform.rotation.y = rotq[1]
+        t.transform.rotation.z = rotq[2]
+        t.transform.rotation.w = rotq[3]
+        self.broadcaster.sendTransform(t)
+
     def _img_callback(self, msg):
         frame_index = self.timestamp_map[msg.header.stamp.to_nsec()]
         for i, f in enumerate(self.frame_map[frame_index]):
@@ -108,14 +126,26 @@ class BoxSubPub():
                     color)    
             else:
                 #FIXME change Marker types based on object type (ie car vs pedestrian)
-                self._publish_marker(
-                    Marker.CUBE, 0, msg.header.stamp,
-                    trans, rotq, [l, w, h],
-                    color)
-                self._publish_marker(
-                    Marker.ARROW, 1, msg.header.stamp,
-                    trans, rotq, [l/2, w/2, h/2],
-                    color)
+                if f.object_type == 'Pedestrian':
+                    self._publish_marker(
+                        Marker.CYLINDER, 0, msg.header.stamp,
+                        trans, rotq, [w, w, h],
+                        color)
+                    self._publish_marker(
+                        Marker.ARROW, 1, msg.header.stamp,
+                        trans, rotq, [w/2, w/2, w/2],
+                        color)
+                else:
+                    self._publish_marker(
+                        Marker.CUBE, 0, msg.header.stamp,
+                        trans, rotq, [l, w, h],
+                        color)
+                    self._publish_marker(
+                        Marker.ARROW, 1, msg.header.stamp,
+                        trans, rotq, [l/2, w/2, h/2],
+                        color)
+
+            self._send_transform(trans, rotq, i)
 
 
 def extract_bag_timestamps(bag_file):
@@ -137,7 +167,7 @@ def generate_frame_map(tracklets):
             rot = t.rots[i]
             rotq = kd.Rotation.RPY(rot[0], rot[1], rot[2]).GetQuaternion()
             frame_map[frame_index].append(
-                Frame(
+                FrameObs(
                     t.trans[i],
                     rotq,
                     t.object_type,
@@ -173,8 +203,10 @@ def main():
     timestamp_map = extract_bag_timestamps(bag_file)
     frame_map = generate_frame_map(tracklets)
     BoxSubPub(frame_map, timestamp_map, sphere)
-    subprocess.call(['rosbag','play', bag_file, '-l', '-q'])
 
+    p=subprocess.call(['rosbag','play', bag_file, '-l', '-q'])
+    os.kill(p, signal.SIGTERM)
+    exit(0)
 
 if __name__ == '__main__':
     main()
